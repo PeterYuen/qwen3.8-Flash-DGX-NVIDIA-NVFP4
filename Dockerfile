@@ -14,6 +14,7 @@
 #   8. Deterministic persistent_topk kernel           (VLLM_QSA_DET_TOPK=1) — replaces 5 at no prefill cost
 #   9. M%4 padding for the blockwise-fp8 GEMM         (VLLM_FP8_PAD_M4=1)   — hybrid mode with prefix caching OFF
 #  10. Reduced draft vocabulary for the MTP drafter    (VLLM_MTP_DRAFT_VOCAB=<ids.npy>) — +20% decode, same tournament score
+#  11. BF16 MTP experts (missing FP8 128x128 block-scale MoE method)      — lets --speculative-config mtp work
 #
 #   docker build -t qwen38-flash-dgx .
 #
@@ -148,3 +149,126 @@ RUN python3 /tmp/fp8_m4pad_patch.py && rm /tmp/fp8_m4pad_patch.py \
 COPY src/patch_mtp_draft_vocab.py /tmp/patch_mtp_draft_vocab.py
 COPY src/draft_vocab_65536.npy /opt/llm/draft_vocab_65536.npy
 RUN python3 /tmp/patch_mtp_draft_vocab.py ${SP}/vllm/models/qwen3_8_flash_next/nvidia/mtp.py && rm /tmp/patch_mtp_draft_vocab.py
+
+# --- 11. BF16 MTP experts (workaround for missing FP8 128x128 block-scale MoE method) ----------
+# The NVIDIA NVFP4 checkpoint's MTP head stores its experts as FP8 with 128x128 block scales
+# (weight_scale_inv shape [H/128, I/128]). This vLLM build has no MoE method for that layout,
+# only a linear one (ModelOptFp8PbWoLinearMethod). The loader therefore fails with:
+#   AttributeError: Layer mtp.layers.48.mlp.experts has no parameter 'w2_weight_scale_inv'
+#                   for checkpoint weight 'mtp.layers.48.mlp.experts.0.down_proj.weight_scale_inv'
+# The MTP head is tiny (~625 MB total), so we dequantize it to BF16 at load time and force
+# the expert layers to allocate plain BF16 parameters instead of FP8 + block-scale slots.
+# Inert unless --speculative-config '{"method":"mtp",...}' is passed.
+#
+# The helper definitions are PREPENDED to the top of mtp.py (not inserted before the class),
+# because Qwen3_8FlashNextMTP is preceded by @support_torch_compile(...) and inserting
+# between the decorator and the class is a SyntaxError. Section 11b (separate RUN, below)
+# wires the dequantizer into Qwen3_8FlashNextMTP.load_weights.
+RUN python3 - <<'PYEOF'
+from pathlib import Path
+
+mtp_path = Path("/usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/mtp.py")
+src = mtp_path.read_text()
+
+INJECT = '''
+# --- qwen38-flash-dgx: BF16 MTP experts (missing FP8 128x128 block-scale MoE method) ---
+import torch as _bf16_mtp_torch
+
+
+class _MTPExpertsUnquantizedWrapper:
+    """Quant-config wrapper that returns None for MoE expert layers, so they
+    allocate plain BF16 parameters instead of FP8 weight + block scales."""
+
+    def __init__(self, inner):
+        object.__setattr__(self, "_inner", inner)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def get_quant_method(self, layer, prefix):
+        if hasattr(layer, "num_experts") and hasattr(layer, "top_k"):
+            return None
+        return self._inner.get_quant_method(layer, prefix)
+
+
+def _dequantize_mtp_experts(weights):
+    """Dequantize FP8 128x128 block-scale MTP expert weights to BF16.
+
+    Buffers all incoming tensors because safetensors yields `.weight` before
+    `.weight_scale_inv` lexicographically and both are needed. The MTP head
+    is small, so buffering is acceptable.
+    """
+    buf = []
+    scales = {}
+    for name, tensor in weights:
+        buf.append((name, tensor))
+        if name.endswith(".weight_scale_inv"):
+            scales[name[: -len("_scale_inv")]] = tensor
+    for name, tensor in buf:
+        if name.endswith(".weight_scale_inv"):
+            continue
+        if name in scales:
+            scale = scales[name]
+            w = tensor.to(_bf16_mtp_torch.bfloat16)
+            s = (scale.to(_bf16_mtp_torch.bfloat16)
+                 .repeat_interleave(128, dim=0)
+                 .repeat_interleave(128, dim=1))
+            s = s[: w.shape[0], : w.shape[1]]
+            yield name, w * s
+        else:
+            yield name, tensor
+# --- end qwen38-flash-dgx patch ---
+'''
+
+# Prepend at the very top of the module. Prepending avoids landing between
+# the @support_torch_compile(...) decorator and the class it decorates.
+if "_MTPExpertsUnquantizedWrapper" not in src:
+    src = INJECT + "\n\n" + src
+
+# Wrap the draft quant config so MTP expert layers allocate BF16 params.
+OLD_CFG = "draft_vllm_config.quant_config = draft_quant_config"
+if OLD_CFG in src:
+    NEW_CFG = (
+        "draft_vllm_config.quant_config = (\n"
+        "            _MTPExpertsUnquantizedWrapper(draft_quant_config)\n"
+        "            if draft_quant_config is not None else None\n"
+        "        )"
+    )
+    src = src.replace(OLD_CFG, NEW_CFG, 1)
+
+mtp_path.write_text(src)
+print("mtp.py patched: buffered BF16 MTP experts prepended + quant-config wrapper")
+PYEOF
+
+# --- 11b. Wire the buffered dequantizer into Qwen3_8FlashNextMTP.load_weights ----------
+# Separate RUN block: section 11's own check matched the function *definition* rather
+# than a call site, so the load_weights hook was skipped. This step uses the assignment
+# expression as the marker, which cannot collide with the definition.
+RUN python3 - <<'PYEOF'
+from pathlib import Path
+
+p = Path("/usr/local/lib/python3.12/dist-packages/vllm/models/qwen3_8_flash_next/nvidia/mtp.py")
+src = p.read_text()
+
+CALL_MARKER = "weights = _dequantize_mtp_experts(weights)"
+if CALL_MARKER in src:
+    print("mtp.py: load_weights already wired")
+else:
+    ANCHOR = (
+        "    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:\n"
+        "        def remap_weight_names():\n"
+        "            for name, weight in weights:\n"
+        "                remapped_name = _remap_mtp_weight_name(name)\n"
+    )
+    assert ANCHOR in src, "MTP.load_weights anchor not found"
+    REPLACEMENT = (
+        "    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:\n"
+        "        weights = _dequantize_mtp_experts(weights)\n"
+        "        def remap_weight_names():\n"
+        "            for name, weight in weights:\n"
+        "                remapped_name = _remap_mtp_weight_name(name)\n"
+    )
+    src = src.replace(ANCHOR, REPLACEMENT, 1)
+    p.write_text(src)
+    print("mtp.py: load_weights wired to _dequantize_mtp_experts")
+PYEOF
